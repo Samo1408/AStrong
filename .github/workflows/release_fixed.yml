@@ -1,0 +1,112 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Release tag, e.g. v1.0.3'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve release tag
+        id: release
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_EVENT_NAME}" == "push" ]]; then
+            tag="${GITHUB_REF_NAME}"
+          else
+            tag="${{ inputs.release_tag }}"
+          fi
+          if [[ ! "$tag" =~ ^v[0-9]+(\.[0-9]+){1,2}([.-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Invalid release tag: $tag"
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "Release tag: $tag"
+
+      - name: Create release tag for manual run
+        if: github.event_name == 'workflow_dispatch'
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ steps.release.outputs.tag }}"
+          if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null 2>&1; then
+            echo "::error::Tag $tag already exists on origin. Use a different release_tag."
+            exit 1
+          fi
+          git tag "$tag" "$GITHUB_SHA"
+          git push origin "refs/tags/$tag"
+
+      - name: Install packaging tools
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends zip unzip
+
+      - name: Use committed native binaries (skip the cargo-ndk step in CI)
+        run: find native -path '*/prebuilt/*' -type f -exec touch {} +
+
+      - name: Build both module zips
+        run: bash build.sh
+
+      - name: Release notes from CHANGELOG
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ steps.release.outputs.tag }}"
+          awk -v v="## ${tag}" '$0==v {f=1; next} /^## / {f=0} f {print}' CHANGELOG.md > RELEASE_NOTES.md
+          echo "----- notes -----"
+          cat RELEASE_NOTES.md
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.release.outputs.tag }}
+          name: ${{ steps.release.outputs.tag }}
+          body_path: RELEASE_NOTES.md
+          files: out/AlwaysStrong-*.zip
+          draft: false
+          prerelease: false
+          fail_on_unmatched_files: true
+
+      - name: Point the update manifests at this release
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ steps.release.outputs.tag }}"
+          git fetch --no-tags origin +refs/heads/main:refs/heads/main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" main; then
+            echo "::notice::commit $GITHUB_SHA is not on main — leaving the manifests alone"
+            exit 0
+          fi
+          git checkout main
+          ver=$(sed -n 's/^version=//p' module/module.prop)
+          code=$(sed -n 's/^versionCode=//p' module/module.prop)
+          write_manifest() {
+            printf '{\n  "version": "%s",\n  "versionCode": %s,\n  "zipUrl": "https://github.com/%s/releases/download/%s/%s",\n  "changelog": "https://raw.githubusercontent.com/%s/main/CHANGELOG.md"\n}\n' \
+              "$ver" "$code" "$GITHUB_REPOSITORY" "$tag" "$2" "$GITHUB_REPOSITORY" > "$1"
+          }
+          fork_zip=$(cd out && ls AlwaysStrong-*.zip | grep -v -- '-inject' | head -1)
+          inj_zip=$(cd out && ls AlwaysStrong-*-inject.zip 2>/dev/null | head -1 || true)
+          write_manifest update.json "$fork_zip"
+          [ -n "$inj_zip" ] && write_manifest update-inject.json "$inj_zip"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add update.json update-inject.json
+          git diff --cached --quiet && { echo "manifests already current"; exit 0; }
+          git commit -m "chore: point update manifests at $tag"
+          git push origin main
