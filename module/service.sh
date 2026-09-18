@@ -3,6 +3,20 @@ MODDIR="${0%/*}"
 MODPATH="$MODDIR"
 cd "$MODDIR"
 
+# --- Battery/thermal guard --------------------------------------------------
+# Keep background helper daemons at a lower CPU scheduling priority. This does
+# not stop the attestation engine; it only lets foreground Android work win CPU
+# time when the helper is active.
+renice_bg() {
+    local p n
+    for p in "$@"; do
+        [ -n "$p" ] || continue
+        for n in $(pidof "$p" 2>/dev/null); do
+            toybox renice -n 10 -p "$n" >/dev/null 2>&1 || renice -n 10 -p "$n" >/dev/null 2>&1 || true
+        done
+    done
+}
+
 set +o standalone 2>/dev/null
 unset ASH_STANDALONE
 
@@ -150,6 +164,8 @@ pkill -9 -f TEESimulator 2>/dev/null || true
 # (TEESimulator). TrickyStoreOSS is already running from the early start above.
 if ! attest_early 2>/dev/null; then
     attest_start
+    # Give supervisor/TEE a lower scheduling priority once the forked children exist.
+    ( sleep 2; renice_bg TEESimulator supervisor daemon ) &
 fi
 
 # --- aswatcher native daemon (inotify target.txt + Xposed + conflict) ---
@@ -165,7 +181,9 @@ if [ -x "$AS_BIN" ]; then
     {
         sleep 5
         "$AS_BIN" &
-        log -t "AlwaysStrong" "aswatcher launched ($AS_ABI)"
+        sleep 1
+        renice_bg aswatcher
+        log -t "AlwaysStrong" "aswatcher launched ($AS_ABI) (nice=10)"
     } &
 fi
 
@@ -183,7 +201,9 @@ fi
     # "Pixel 10" in scrcpy/ADB. It stays in the tree for manual use only.
 
     # Suppress our log tags + scrub ANR/tombstone traces (self-daemonizes).
-    if [ ! -f "$CFG/no_logcat_cleanup" ] && [ -f "$MODDIR/logcat_cleanup.sh" ]; then
+    # Periodic ANR/tombstone scrubbing costs I/O every 30 minutes. Keep it
+    # opt-in for battery-friendly installs; create enable_logcat_cleanup to use it.
+    if [ -f "$CFG/enable_logcat_cleanup" ] && [ -f "$MODDIR/logcat_cleanup.sh" ]; then
         MODPATH="$MODDIR" sh "$MODDIR/logcat_cleanup.sh" >/dev/null 2>&1 &
     fi
 } &
@@ -226,14 +246,21 @@ fi
 # --- TEESimulator + aswatcher watchdog ---
 {
     while true; do
-        sleep 120
+        # A watchdog does not need to poll frequently; 10 minutes is enough to
+        # recover a crashed helper while avoiding needless wakeups.
+        sleep 600
         if ! attest_alive; then
             log -t "AlwaysStrong" "attestation daemon died, restarting..."
             attest_start
+            ( sleep 2; renice_bg TEESimulator supervisor daemon ) &
+        else
+            renice_bg TEESimulator supervisor daemon
         fi
         if [ -x "$AS_BIN" ] && ! pidof aswatcher >/dev/null 2>&1; then
             log -t "AlwaysStrong" "aswatcher died, restarting..."
             "$AS_BIN" &
+            sleep 1
+            renice_bg aswatcher
         fi
     done
 }&
@@ -321,13 +348,13 @@ fi
     CFG=/data/adb/tricky_store
     export MODPATH="$MODDIR"
     while true; do
-        # Interval is user-configurable from the WebUI. Default 1h, floor 60s
-        # so a misconfigured 0/-1/garbage doesn't busy-spin the loop.
+        # Interval is user-configurable from the WebUI. Default 6h, floor 15m
+        # so a misconfigured value cannot create frequent network/CPU wakeups.
         INT=$(cat "$CFG/hourly_interval_sec" 2>/dev/null)
         case "$INT" in
-            ''|*[!0-9]*) INT=3600 ;;
+            ''|*[!0-9]*) INT=21600 ;;
         esac
-        [ "$INT" -lt 60 ] && INT=60
+        [ "$INT" -lt 900 ] && INT=900
         sleep "$INT"
         if [ ! -f "$CFG/no_auto_fp" ]; then
             FP_DONE=0
