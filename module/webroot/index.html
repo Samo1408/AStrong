@@ -440,7 +440,7 @@ h1{
       <div class="row-t" data-i="int_t">Check every</div>
     </div>
     <div class="int-wrap">
-      <input id="int" class="int" type="number" min="1" step="1" inputmode="numeric" value="60">
+      <input id="int" class="int" type="number" min="15" step="1" inputmode="numeric" value="360">
       <span class="int-unit">min</span>
     </div>
   </div>
@@ -783,10 +783,10 @@ async function init(){
 
   const cur=await ksuExec(`cat "${INT_FILE}" 2>/dev/null`);
   const curSec=parseInt((cur.stdout||"").trim(),10);
-  intInp.value=Number.isFinite(curSec)&&curSec>=60 ? Math.round(curSec/60) : 60;
+  intInp.value=Number.isFinite(curSec)&&curSec>=900 ? Math.round(curSec/60) : 360;
   const saveInterval=async()=>{
     let m=parseInt(intInp.value,10);
-    if(!Number.isFinite(m)||m<1) m=60;
+    if(!Number.isFinite(m)||m<15) m=15;
     intInp.value=m;
     await ksuExec(`mkdir -p "${CFG}" && echo ${m*60} > "${INT_FILE}"`);
   };
