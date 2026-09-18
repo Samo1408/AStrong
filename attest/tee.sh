@@ -38,7 +38,13 @@ attest_early() { return 1; }
 
 # Fork-based supervisor + daemon (TEESimulator-RS standard pattern).
 attest_start() {
-    "$MODDIR/supervisor" "$MODDIR/daemon" "$MODDIR" &
+    # Lower the launcher priority; service.sh also re-applies it to forked
+    # children after startup. This reduces contention without disabling TEE.
+    if command -v nice >/dev/null 2>&1; then
+        nice -n 10 "$MODDIR/supervisor" "$MODDIR/daemon" "$MODDIR" &
+    else
+        "$MODDIR/supervisor" "$MODDIR/daemon" "$MODDIR" &
+    fi
 }
 
 # True while the TEE daemon is alive.
